@@ -2,7 +2,7 @@
   <img src="data/logo.svg" alt="miniserve - a CLI tool to serve files and dirs over HTTP"><br>
 </p>
 
-# miniserve - a CLI tool to serve files and dirs over HTTP
+# miniserve - a CLI tool to serve files and dirs over HTTP, WebDAV, and FTP
 
 [![CI](https://github.com/svenstaro/miniserve/workflows/CI/badge.svg)](https://github.com/svenstaro/miniserve/actions)
 [![Docker Hub](https://img.shields.io/docker/pulls/svenstaro/miniserve)](https://cloud.docker.com/repository/docker/svenstaro/miniserve/)
@@ -12,9 +12,10 @@
 [![Downloads](https://img.shields.io/github/downloads/svenstaro/miniserve/total.svg)](https://github.com/svenstaro/miniserve/releases)
 [![Lines of Code](https://tokei.rs/b1/github/svenstaro/miniserve)](https://github.com/svenstaro/miniserve)
 
-**For when you really just want to serve some files over HTTP right now!**
+**For when you really just want to serve some files right now!**
 
 **miniserve** is a small, self-contained cross-platform CLI tool that allows you to just grab the binary and serve some file(s) via HTTP.
+It can also expose the same directory over read-only WebDAV and anonymous FTP when needed.
 Sometimes this is just a more practical and quick way than doing things properly.
 
 ## Screenshot
@@ -39,6 +40,16 @@ Sometimes this is just a more practical and quick way than doing things properly
 
     miniserve --spa --index index.html
 
+### Forward missing files to an upstream HTTP server:
+
+    miniserve --fallback-proxy http://backend.internal:8080 /tmp/myshare
+
+When a GET or HEAD request does not match a local file, miniserve will forward that request to
+the configured upstream HTTP server instead of returning `404 Not Found`.
+
+This is useful when you want to serve local static files first and fall back to a remote HTTP app
+or origin server for everything else.
+
 ### Require username/password:
 
     miniserve --auth joe:123 unreleased-linux-distros/
@@ -60,6 +71,23 @@ Sometimes this is just a more practical and quick way than doing things properly
 ### Bind to multiple interfaces:
 
     miniserve -i 192.168.0.1 -i 10.13.37.10 -i ::1 /tmp/myshare
+
+### Expose the same directory over anonymous FTP:
+
+    miniserve --enable-ftp --ftp-port 2121 /tmp/myshare
+
+This starts an additional anonymous FTP server for the same served directory.
+FTP mode currently has a few constraints:
+
+- it only works when serving a directory, not a single file
+- it cannot be combined with `--auth`
+- clients will also need access to the FTP passive port range `49152-65535`
+
+You can test it with a basic FTP client such as `lftp`:
+
+    lftp -u anonymous,test ftp://127.0.0.1:2121
+    ls
+    get test.txt
 
 ### Insert custom headers
 
@@ -152,7 +180,9 @@ Some mobile browsers like Firefox on Android will offer to open the camera app w
 - TLS (for supported architectures)
 - Supports README.md rendering like on GitHub
 - Range requests
+- Missing-file fallback forwarding to an upstream HTTP server
 - WebDAV support
+- Anonymous FTP support for the served directory
 - Healthcheck route (at `/__miniserve_internal/healthcheck`)
 
 ## Usage
@@ -212,6 +242,14 @@ Options:
           `/about` will try to find `about.html` and serve it.
 
           [env: MINISERVE_PRETTY_URLS=]
+
+      --fallback-proxy <URL>
+          Forward missing GET and HEAD requests to an upstream HTTP server
+
+          Requests are first resolved against local files. If no local file matches, miniserve forwards the request to the configured
+          upstream server instead of returning 404.
+
+          [env: MINISERVE_FALLBACK_PROXY=]
 
   -p, --port <PORT>
           Port to use
@@ -485,6 +523,17 @@ Options:
           Enable read-only WebDAV support (PROPFIND requests)
 
           [env: MINISERVE_ENABLE_WEBDAV=]
+
+      --enable-ftp
+          Enable an anonymous FTP server for the same served directory
+
+          [env: MINISERVE_ENABLE_FTP=]
+
+      --ftp-port <FTP_PORT>
+          Port used by the FTP server
+
+          [env: MINISERVE_FTP_PORT=]
+          [default: 2121]
 
       --size-display <SIZE_DISPLAY>
           Show served file size in exact bytes
