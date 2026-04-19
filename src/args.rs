@@ -442,6 +442,14 @@ pub struct CliArgs {
     #[arg(long, env = "MINISERVE_ENABLE_WEBDAV")]
     pub enable_webdav: bool,
 
+    /// Enable an anonymous FTP server for the same served directory.
+    #[arg(long, env = "MINISERVE_ENABLE_FTP")]
+    pub enable_ftp: bool,
+
+    /// Port used by the FTP server.
+    #[arg(long = "ftp-port", default_value = "2121", env = "MINISERVE_FTP_PORT")]
+    pub ftp_port: u16,
+
     /// Show served file size in exact bytes
     #[arg(long, default_value_t = SizeDisplay::Human, env = "MINISERVE_SIZE_DISPLAY")]
     pub size_display: SizeDisplay,

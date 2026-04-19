@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener};
+use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -22,9 +23,12 @@ use dav_server::{
     actix::{DavRequest, DavResponse},
 };
 use fast_qr::QRBuilder;
+use futures::future::try_join_all;
+use libunftp::{ServerBuilder, options::PassiveHost};
 use log::{error, info, trace, warn};
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
+use unftp_sbe_fs::Filesystem;
 
 mod archive;
 mod args;
@@ -48,6 +52,10 @@ use crate::webdav_fs::RestrictedFs;
 static STYLESHEET: &str = grass::include!("data/style.scss");
 
 fn main() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let args = args::CliArgs::parse();
 
     if let Some(shell) = args.print_completions {
@@ -75,10 +83,6 @@ fn main() -> Result<()> {
 
 #[actix_web::main(miniserve)]
 async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
     let log_level = if miniserve_config.verbose {
         simplelog::LevelFilter::Info
     } else {
@@ -130,6 +134,16 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         return Err(StartupError::WebdavWithFileServePath(
             miniserve_config.path.to_string_lossy().to_string(),
         ));
+    }
+
+    if miniserve_config.ftp_enabled && miniserve_config.path.is_file() {
+        return Err(StartupError::FtpWithFileServePath(
+            miniserve_config.path.to_string_lossy().to_string(),
+        ));
+    }
+
+    if miniserve_config.ftp_enabled && !miniserve_config.auth.is_empty() {
+        return Err(StartupError::FtpWithHttpAuth);
     }
 
     let inside_config = miniserve_config.clone();
@@ -226,6 +240,23 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
             .collect::<Vec<_>>()
     };
 
+    let ftp_bind_interfaces = ftp_bind_interfaces(&miniserve_config.interfaces);
+
+    let ftp_display_urls = if miniserve_config.ftp_enabled {
+        Some(
+            ftp_bind_interfaces
+                .iter()
+                .copied()
+                .map(|addr| match addr {
+                    IpAddr::V4(_) => format!("ftp://{}:{}", addr, miniserve_config.ftp_port),
+                    IpAddr::V6(_) => format!("ftp://[{}]:{}", addr, miniserve_config.ftp_port),
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+
     let socket_addresses = miniserve_config
         .interfaces
         .iter()
@@ -313,6 +344,16 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
                 .collect::<Vec<_>>()
                 .join("\n    "),
         );
+        if let Some(ftp_urls) = &ftp_display_urls {
+            println!(
+                "FTP available at (non-exhaustive list):\n    {}\n",
+                ftp_urls
+                    .iter()
+                    .map(|url| url.green().bold().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n    "),
+            );
+        }
     }
 
     // print QR code to terminal
@@ -337,8 +378,62 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         println!("Quit by pressing CTRL-C");
     }
 
-    srv.await
-        .map_err(|e| StartupError::IoError("".to_owned(), e))
+    let http_server = async move {
+        srv.await
+            .map_err(|e| StartupError::IoError("".to_owned(), e))
+    };
+
+    if miniserve_config.ftp_enabled {
+        tokio::try_join!(http_server, run_ftp_servers(miniserve_config.clone()))?;
+        Ok(())
+    } else {
+        http_server.await
+    }
+}
+
+async fn run_ftp_servers(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
+    let listeners = ftp_bind_interfaces(&miniserve_config.interfaces)
+        .iter()
+        .copied()
+        .map(|interface| run_ftp_server(interface, miniserve_config.ftp_port, miniserve_config.path.clone()))
+        .collect::<Vec<_>>();
+
+    try_join_all(listeners).await.map(|_| ())
+}
+
+async fn run_ftp_server(interface: IpAddr, port: u16, root: PathBuf) -> Result<(), StartupError> {
+    let bind_addr = SocketAddr::new(interface, port);
+    let ftp_root = root.clone();
+    let server = ServerBuilder::new(Box::new(move || {
+        Filesystem::new(ftp_root.clone()).expect("FTP root should be a readable directory")
+    }))
+    .greeting("miniserve FTP")
+    .passive_host(PassiveHost::FromConnection)
+    .build()
+    .map_err(|err| StartupError::IoError(format!("Failed to configure FTP server for {bind_addr}"), std::io::Error::other(err.to_string())))?;
+
+    server
+        .listen(bind_addr.to_string())
+        .await
+        .map_err(|err| StartupError::IoError(format!("Failed to bind FTP server to {bind_addr}"), std::io::Error::other(err.to_string())))
+}
+
+fn ftp_bind_interfaces(interfaces: &[IpAddr]) -> Vec<IpAddr> {
+    if interfaces.iter().any(IpAddr::is_unspecified) {
+        if let Some(addr) = interfaces
+            .iter()
+            .copied()
+            .find(|addr| addr.is_unspecified() && addr.is_ipv4())
+        {
+            return vec![addr];
+        }
+
+        if let Some(addr) = interfaces.iter().copied().find(IpAddr::is_unspecified) {
+            return vec![addr];
+        }
+    }
+
+    interfaces.to_vec()
 }
 
 /// Allows us to set low-level socket options

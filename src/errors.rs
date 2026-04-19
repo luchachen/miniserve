@@ -29,6 +29,12 @@ Please set an explicit serve path like: `miniserve /my/path`")]
 
     #[error("The --enable-webdav option was provided, but the serve path '{0}' is a file")]
     WebdavWithFileServePath(String),
+
+    #[error("The --enable-ftp option was provided, but the serve path '{0}' is a file")]
+    FtpWithFileServePath(String),
+
+    #[error("The --enable-ftp option cannot be combined with HTTP authentication because FTP auth is not implemented")]
+    FtpWithHttpAuth,
 }
 
 #[derive(Debug, Error)]

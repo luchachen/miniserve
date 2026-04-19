@@ -41,6 +41,7 @@ hex = "0.4"
 httparse = "1"
 if-addrs = "0.15"
 libflate = "2"
+libunftp = "0.23"
 log = "0.4"
 maud = "0.27"
 mime = "0.3"
@@ -61,6 +62,7 @@ tar = "0.4"
 tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1.47.1", features = ["fs", "macros"] }
+unftp-sbe-fs = "0.4"
 zip = { version = "8", default-features = false }
 
 [features]

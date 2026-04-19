@@ -191,6 +191,12 @@ pub struct MiniserveConfig {
     /// If enabled, respond to WebDAV requests (read-only).
     pub webdav_enabled: bool,
 
+    /// If enabled, run an FTP server for the same directory.
+    pub ftp_enabled: bool,
+
+    /// Port used by the FTP server.
+    pub ftp_port: u16,
+
     /// If enabled, will show in exact byte size of the file
     pub show_exact_bytes: bool,
 
@@ -381,6 +387,8 @@ impl MiniserveConfig {
             readme: args.readme,
             disable_indexing: args.disable_indexing,
             webdav_enabled: args.enable_webdav,
+            ftp_enabled: args.enable_ftp,
+            ftp_port: args.ftp_port,
             tls_rustls_config: tls_rustls_server_config,
             compress_response: args.compress_response,
             show_exact_bytes,

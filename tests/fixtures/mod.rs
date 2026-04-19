@@ -150,57 +150,120 @@ where
     I: IntoIterator + Clone,
     I::Item: AsRef<std::ffi::OsStr>,
 {
-    let port = port();
-    let tmpdir = tmpdir();
-    let mut child = Command::new(cargo::cargo_bin!("miniserve"))
-        .arg(tmpdir.path())
-        .arg("-v")
-        .arg("-p")
-        .arg(port.to_string())
-        .args(args.clone())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Couldn't run test binary");
     let is_tls = args
+        .clone()
         .into_iter()
         .any(|x| x.as_ref().to_str().unwrap().contains("tls"));
 
-    // Read from stdout/stderr in the background and print/eprint everything read.
-    // This dance is required to allow test output capturing to work as expected.
-    // See https://github.com/rust-lang/rust/issues/92370 and https://github.com/rust-lang/rust/issues/90785
+    for _ in 0..5 {
+        let port = port();
+        let tmpdir = tmpdir();
+        let readiness_checks = readiness_targets(args.clone(), port);
+        let mut child = Command::new(cargo::cargo_bin!("miniserve"))
+            .arg(tmpdir.path())
+            .arg("-v")
+            .arg("-p")
+            .arg(port.to_string())
+            .args(args.clone())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Couldn't run test binary");
 
-    let stdout = child.stdout.take().expect("Child process stdout is None");
-    thread::spawn(move || {
-        BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-            .for_each(|line| println!("[miniserve stdout] {line}"));
-    });
+        // Read from stdout/stderr in the background and print/eprint everything read.
+        // This dance is required to allow test output capturing to work as expected.
+        // See https://github.com/rust-lang/rust/issues/92370 and https://github.com/rust-lang/rust/issues/90785
 
-    let stderr = child.stderr.take().expect("Child process stderr is None");
-    thread::spawn(move || {
-        BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-            .for_each(|line| eprintln!("[miniserve stderr] {line}"));
-    });
+        let stdout = child.stdout.take().expect("Child process stdout is None");
+        thread::spawn(move || {
+            BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+                .for_each(|line| println!("[miniserve stdout] {line}"));
+        });
 
-    wait_for_port(port);
-    TestServer::new(port, tmpdir, child, is_tls)
+        let stderr = child.stderr.take().expect("Child process stderr is None");
+        thread::spawn(move || {
+            BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+                .for_each(|line| eprintln!("[miniserve stderr] {line}"));
+        });
+
+        if wait_for_port(&mut child, &readiness_checks) {
+            return TestServer::new(port, tmpdir, child, is_tls);
+        }
+    }
+
+    panic!("timeout starting test server after multiple attempts");
 }
 
 /// Wait a max of 1s for the port to become available.
-fn wait_for_port(port: u16) {
+fn wait_for_port(child: &mut Child, targets: &[String]) -> bool {
     let start_wait = Instant::now();
 
-    while !port_check::is_port_reachable(format!("localhost:{port}")) {
+    while !targets.iter().all(port_check::is_port_reachable) {
+        if child.try_wait().expect("Couldn't poll child status").is_some() {
+            return false;
+        }
+
         sleep(Duration::from_millis(100));
 
         if start_wait.elapsed().as_secs() > 5 {
-            panic!("timeout waiting for port {port}");
+            return false;
         }
     }
+
+    true
+}
+
+fn readiness_targets<I>(args: I, port: u16) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    let mut need_ipv4 = false;
+    let mut need_ipv6 = false;
+    let mut saw_interface_flag = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-i" || arg == "--interfaces" {
+            saw_interface_flag = true;
+            if let Some(value) = iter.next() {
+                if let Ok(addr) = value.parse::<std::net::IpAddr>() {
+                    if addr.is_ipv4() {
+                        need_ipv4 = true;
+                    }
+                    if addr.is_ipv6() {
+                        need_ipv6 = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !saw_interface_flag {
+        need_ipv4 = true;
+        need_ipv6 = true;
+    }
+
+    let mut targets = Vec::new();
+    if need_ipv4 {
+        targets.push(format!("127.0.0.1:{port}"));
+    }
+    if need_ipv6 {
+        targets.push(format!("[::1]:{port}"));
+    }
+    if targets.is_empty() {
+        targets.push(format!("localhost:{port}"));
+    }
+    targets
 }
 
 pub struct TestServer {
