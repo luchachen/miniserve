@@ -109,6 +109,9 @@ pub struct MiniserveConfig {
     /// `/about` will try to find `about.html` and serve it.
     pub pretty_urls: bool,
 
+    /// Optional upstream HTTP server used when a local GET or HEAD path is missing.
+    pub fallback_proxy: Option<reqwest::Url>,
+
     /// Enable QR code display
     pub show_qrcode: bool,
 
@@ -351,6 +354,7 @@ impl MiniserveConfig {
             spa: args.spa,
             quiet: args.quiet,
             pretty_urls: args.pretty_urls,
+            fallback_proxy: args.fallback_proxy,
             on_duplicate_files: args.on_duplicate_files,
             show_qrcode: args.qrcode,
             directory_size: args.directory_size,

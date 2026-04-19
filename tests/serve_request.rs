@@ -1,4 +1,9 @@
 use std::process::{Command, Stdio};
+use std::{
+    io::{BufRead, BufReader, Write},
+    net::TcpListener,
+    thread,
+};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -436,6 +441,47 @@ fn serve_file_instead_of_404_in_pretty_urls_mode(
             .next()
             .is_some()
     );
+
+    Ok(())
+}
+
+#[rstest]
+fn proxies_missing_files_to_upstream(reqwest_client: Client) -> Result<(), Error> {
+    let upstream_listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let upstream_port = upstream_listener.local_addr()?.port();
+    let upstream_handle = thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = upstream_listener.accept()?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line)?;
+        assert!(request_line.starts_with("GET /missing.txt HTTP/1.1"));
+
+        loop {
+            let mut header_line = String::new();
+            reader.read_line(&mut header_line)?;
+            if header_line == "\r\n" {
+                break;
+            }
+        }
+
+        stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nfrom upstream",
+        )?;
+        Ok(())
+    });
+
+    let server = server(&[
+        "--fallback-proxy",
+        &format!("http://127.0.0.1:{upstream_port}"),
+    ]);
+
+    let response = reqwest_client
+        .get(server.url().join("missing.txt")?)
+        .send()?
+        .error_for_status()?;
+    assert_eq!(response.text()?, "from upstream");
+
+    upstream_handle.join().unwrap()?;
 
     Ok(())
 }

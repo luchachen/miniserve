@@ -9,7 +9,7 @@ use actix_web::{
     App, HttpRequest, HttpResponse, Responder,
     dev::{ServiceRequest, ServiceResponse, fn_service},
     guard,
-    http::{Method, header::ContentType},
+    http::{Method, header, header::ContentType},
     middleware, web,
 };
 use actix_web_httpauth::middleware::HttpAuthentication;
@@ -75,6 +75,10 @@ fn main() -> Result<()> {
 
 #[actix_web::main(miniserve)]
 async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let log_level = if miniserve_config.verbose {
         simplelog::LevelFilter::Info
     } else {
@@ -241,12 +245,19 @@ async fn run(miniserve_config: MiniserveConfig) -> Result<(), StartupError> {
         ]
         .join("\n"),
     );
+    let upstream_client = web::Data::new(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Couldn't build upstream client"),
+    );
 
     let srv = actix_web::HttpServer::new(move || {
         App::new()
             .wrap(configure_header(&inside_config.clone()))
             .app_data(web::Data::new(inside_config.clone()))
             .app_data(stylesheet.clone())
+            .app_data(upstream_client.clone())
             .wrap(from_fn(errors::error_page_middleware))
             .wrap(middleware::Logger::default())
             .wrap(middleware::Condition::new(
@@ -366,40 +377,10 @@ fn configure_app(app: &mut web::ServiceConfig, conf: &MiniserveConfig) {
         // Use specific index file if one was provided.
         if let Some(ref index_file) = conf.index {
             files = files.index_file(index_file.to_string_lossy());
-            // Handle SPA option.
-            //
-            // Note: --spa requires --index in clap.
-            if conf.spa {
-                files = files.default_handler(
-                    NamedFile::open(conf.path.join(index_file))
-                        .expect("Can't open SPA index file."),
-                );
-            }
         }
 
-        // Handle --pretty-urls options.
-        //
-        // We rewrite the request to append ".html" to the path and serve the file. If the
-        // path ends with a `/`, we remove it before appending ".html".
-        //
-        // This is done to allow for pretty URLs, e.g. "/about" instead of "/about.html".
-        if conf.pretty_urls {
-            files = files.default_handler(fn_service(|req: ServiceRequest| async {
-                let (req, _) = req.into_parts();
-                let conf = req
-                    .app_data::<web::Data<MiniserveConfig>>()
-                    .expect("Could not get miniserve config");
-                let mut path_base = req.path()[1..].to_string();
-                if path_base.ends_with('/') {
-                    path_base.pop();
-                }
-                if !path_base.ends_with("html") {
-                    path_base = format!("{path_base}.html");
-                }
-                let file = NamedFile::open_async(conf.path.join(path_base)).await?;
-                let res = file.into_response(&req);
-                Ok(ServiceResponse::new(req, res))
-            }));
+        if conf.pretty_urls || conf.spa || conf.fallback_proxy.is_some() {
+            files = files.default_handler(fn_service(files_default_handler));
         }
 
         if conf.show_hidden {
@@ -450,6 +431,12 @@ fn configure_app(app: &mut web::ServiceConfig, conf: &MiniserveConfig) {
         app.service(dir_service());
     }
 
+    app.default_service(
+        web::route()
+            .guard(guard::Any(guard::Get()).or(guard::Head()))
+            .to(missing_path_handler),
+    );
+
     if conf.webdav_enabled {
         let fs = RestrictedFs::new(&conf.path, conf.show_hidden, conf.no_symlinks);
 
@@ -476,6 +463,142 @@ fn configure_app(app: &mut web::ServiceConfig, conf: &MiniserveConfig) {
 
 async fn dav_handler(req: DavRequest, davhandler: web::Data<DavHandler>) -> DavResponse {
     davhandler.handle(req.request).await.into()
+}
+
+async fn files_default_handler(req: ServiceRequest) -> Result<ServiceResponse, actix_web::Error> {
+    let (req, _) = req.into_parts();
+    let res = missing_path_response(&req)
+        .await
+        .map_err(actix_web::Error::from)?;
+    Ok(ServiceResponse::new(req, res))
+}
+
+async fn missing_path_handler(req: HttpRequest) -> Result<HttpResponse, RuntimeError> {
+    missing_path_response(&req).await
+}
+
+async fn missing_path_response(req: &HttpRequest) -> Result<HttpResponse, RuntimeError> {
+    let conf = req
+        .app_data::<web::Data<MiniserveConfig>>()
+        .expect("Could not get miniserve config");
+
+    if let Some(response) = local_fallback_response(req, conf).await? {
+        return Ok(response);
+    }
+
+    if let Some(upstream_base) = &conf.fallback_proxy {
+        let upstream_client = req
+            .app_data::<web::Data<reqwest::Client>>()
+            .expect("Could not get upstream client");
+        return proxy_missing_request(req, upstream_client.get_ref(), upstream_base).await;
+    }
+
+    Err(RuntimeError::RouteNotFoundError(req.path().to_string()))
+}
+
+async fn local_fallback_response(
+    req: &HttpRequest,
+    conf: &MiniserveConfig,
+) -> Result<Option<HttpResponse>, RuntimeError> {
+    if conf.pretty_urls {
+        let mut path_base = req.path()[1..].to_string();
+        if path_base.ends_with('/') {
+            path_base.pop();
+        }
+        if !path_base.ends_with("html") {
+            path_base = format!("{path_base}.html");
+        }
+        if let Ok(file) = NamedFile::open_async(conf.path.join(path_base)).await {
+            return Ok(Some(file.into_response(req)));
+        }
+        return Ok(None);
+    }
+
+    if conf.spa
+        && let Some(index_file) = &conf.index
+        && let Ok(file) = NamedFile::open_async(conf.path.join(index_file)).await
+    {
+        return Ok(Some(file.into_response(req)));
+    }
+
+    Ok(None)
+}
+
+async fn proxy_missing_request(
+    req: &HttpRequest,
+    upstream_client: &reqwest::Client,
+    upstream_base: &reqwest::Url,
+) -> Result<HttpResponse, RuntimeError> {
+    let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
+        .map_err(|err| RuntimeError::UpstreamProxyError(err.to_string()))?;
+    let upstream_url = build_upstream_url(upstream_base, req);
+
+    let mut upstream_request = upstream_client.request(method, upstream_url);
+    for (name, value) in req.headers() {
+        if name == header::HOST || name == header::CONNECTION || name == header::TRANSFER_ENCODING {
+            continue;
+        }
+        upstream_request = upstream_request.header(name.as_str(), value.as_bytes());
+    }
+
+    let upstream_response = upstream_request
+        .send()
+        .await
+        .map_err(|err| RuntimeError::UpstreamProxyError(err.to_string()))?;
+
+    let status = actix_web::http::StatusCode::from_u16(upstream_response.status().as_u16())
+        .map_err(|err| RuntimeError::UpstreamProxyError(err.to_string()))?;
+    let mut response = HttpResponse::build(status);
+    for (name, value) in upstream_response.headers() {
+        if is_hop_by_hop_header(name.as_str()) {
+            continue;
+        }
+        if let Ok(header_name) = header::HeaderName::try_from(name.as_str())
+            && let Ok(header_value) = header::HeaderValue::from_bytes(value.as_bytes())
+        {
+            response.append_header((header_name, header_value));
+        }
+    }
+
+    if req.method() == Method::HEAD {
+        Ok(response.finish())
+    } else {
+        let body = upstream_response
+            .bytes()
+            .await
+            .map_err(|err| RuntimeError::UpstreamProxyError(err.to_string()))?;
+        Ok(response.body(body))
+    }
+}
+
+fn build_upstream_url(upstream_base: &reqwest::Url, req: &HttpRequest) -> reqwest::Url {
+    let mut upstream_url = upstream_base.clone();
+    let upstream_path = format!(
+        "{}{}",
+        upstream_base.path().trim_end_matches('/'),
+        req.path()
+    );
+    upstream_url.set_path(if upstream_path.is_empty() {
+        "/"
+    } else {
+        upstream_path.as_str()
+    });
+    upstream_url.set_query(req.uri().query());
+    upstream_url
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 async fn error_404(req: HttpRequest) -> Result<HttpResponse, RuntimeError> {

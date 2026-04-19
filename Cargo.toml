@@ -48,6 +48,7 @@ nanoid = "0.4"
 percent-encoding = "2"
 port_check = "0.3"
 regex = "1"
+reqwest = { version = "0.13", features = ["json", "rustls-no-provider"], default-features = false }
 rustix = { version = "1.1.4", features = ["process", "fs"] }
 rustls = { version = "0.23", features = ["ring"], optional = true, default-features = false }
 rustls-pemfile = { version = "2", optional = true }

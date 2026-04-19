@@ -88,6 +88,10 @@ pub enum RuntimeError {
     /// Might occur when trying to access a page that does not exist
     #[error("Route {0} could not be found")]
     RouteNotFoundError(String),
+
+    /// Might occur when forwarding a missing request to an upstream server fails.
+    #[error("Upstream proxy request failed\ncaused by: {0}")]
+    UpstreamProxyError(String),
 }
 
 impl ResponseError for RuntimeError {
@@ -109,6 +113,7 @@ impl ResponseError for RuntimeError {
             E::InvalidHttpCredentials => S::UNAUTHORIZED,
             E::InvalidHttpRequestError(_) => S::BAD_REQUEST,
             E::RouteNotFoundError(_) => S::NOT_FOUND,
+            E::UpstreamProxyError(_) => S::BAD_GATEWAY,
         }
     }
 

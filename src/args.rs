@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
 use clap::{Parser, ValueEnum, ValueHint};
+use reqwest::Url;
 
 use crate::auth;
 use crate::listing::{SortingMethod, SortingOrder};
@@ -99,6 +100,10 @@ pub struct CliArgs {
     /// `/about` will try to find `about.html` and serve it.
     #[arg(long, env = "MINISERVE_PRETTY_URLS")]
     pub pretty_urls: bool,
+
+    /// Forward missing GET and HEAD requests to an upstream HTTP server.
+    #[arg(long = "fallback-proxy", value_name = "URL", env = "MINISERVE_FALLBACK_PROXY")]
+    pub fallback_proxy: Option<Url>,
 
     /// Port to use
     #[arg(
